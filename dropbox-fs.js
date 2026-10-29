@@ -16,6 +16,15 @@
   class NotFound extends Error { constructor(p) { super('Not found: ' + p); this.name = 'NotFoundError'; } }
   class Conflict extends Error { constructor(p) { super('Someone else saved “' + p.split('/').pop() + '” in Dropbox just now. Refresh and try again.'); this.name = 'NoModificationAllowedError'; this.conflict = true; } }
 
+  // turn Dropbox's technical errors into steps you can act on
+  function friendly(txt, status) {
+    const scope = /required scope '([^']+)'/.exec(txt || '');
+    if (scope) { ls.set('refresh', null); return new Error('The Dropbox app needs the permission “' + scope[1] + '”. In dropbox.com/developers/apps → your app → Permissions, tick it (and files.metadata.read, files.content.read, files.content.write, files.metadata.write, account_info.read), click Submit, then sign in again.'); }
+    if (/entire Dropbox Business team|single Dropbox account/i.test(txt || '')) { ls.set('refresh', null); return new Error('The Dropbox app is set up as a team app. In dropbox.com/developers/apps → your app → Permissions, untick every box under “Team scopes” (team_info, team_data, members, groups, sessions, events…), click Submit, then sign in again.'); }
+    if (/invalid_access_token|expired_access_token/.test(txt || '')) { Dbx._tok = null; return new Error('Dropbox sign-in expired — sign in again.'); }
+    if (/Dropbox-API-Path-Root|invalid_root|no_permission/.test(txt || '')) { ls.set('root', null); }
+    return new Error('Dropbox: ' + String(txt || status).slice(0, 300));
+  }
   const Dbx = {
     appKey, redirectUri,
     signedIn: () => !!ls.get('refresh'),
@@ -24,19 +33,21 @@
       const ver = b64url(crypto.getRandomValues(new Uint8Array(48)));
       const ch = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ver)));
       const st = b64url(crypto.getRandomValues(new Uint8Array(16)));
-      sessionStorage.setItem('salescrm.pkce', JSON.stringify({ ver, st }));
+      localStorage.setItem('salescrm.pkce', JSON.stringify({ ver, st, t: Date.now() }));
       location.href = 'https://www.dropbox.com/oauth2/authorize?' + new URLSearchParams({ client_id: key, response_type: 'code', code_challenge: ch, code_challenge_method: 'S256', token_access_type: 'offline', redirect_uri: redirectUri(), state: st });
     },
     // back from Dropbox with ?code=…
     async finishSignIn() {
-      const q = new URLSearchParams(location.search); const code = q.get('code'); if (!code) return false;
-      const saved = JSON.parse(sessionStorage.getItem('salescrm.pkce') || '{}');
+      const q = new URLSearchParams(location.search);
+      if (q.get('error')) { history.replaceState(null, '', redirectUri()); throw new Error('Dropbox said: ' + (q.get('error_description') || q.get('error')).replace(/\+/g, ' ')); }
+      const code = q.get('code'); if (!code) return false;
+      const saved = JSON.parse(localStorage.getItem('salescrm.pkce') || sessionStorage.getItem('salescrm.pkce') || '{}');
       history.replaceState(null, '', redirectUri());
-      if (!saved.ver || saved.st !== q.get('state')) throw new Error('Sign-in didn’t finish — please try again.');
+      if (!saved.ver) throw new Error('Sign-in didn’t finish (this browser lost the sign-in details) — please tap Sign in again.');
       const r = await fetch('https://api.dropboxapi.com/oauth2/token', { method: 'POST', body: new URLSearchParams({ code, grant_type: 'authorization_code', code_verifier: saved.ver, client_id: appKey(), redirect_uri: redirectUri() }) });
       const j = await r.json(); if (!r.ok) throw new Error('Dropbox sign-in failed: ' + (j.error_description || j.error || r.status));
       ls.set('refresh', j.refresh_token); Dbx._tok = j.access_token; Dbx._exp = Date.now() + (j.expires_in - 60) * 1000;
-      sessionStorage.removeItem('salescrm.pkce'); return true;
+      localStorage.removeItem('salescrm.pkce'); return true;
     },
     signOut() { ls.set('refresh', null); ls.set('root', null); ls.set('folder', null); Dbx._tok = null; },
     async token() {
@@ -60,7 +71,7 @@
         if (r.status === 429 || r.status >= 500) { await new Promise(res => setTimeout(res, 800 * (i + 1))); continue; }
         if (r.status === 401) { Dbx._tok = null; continue; }
         const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) { /* text */ }
-        if (!r.ok) { const s = (j && j.error_summary) || txt; const e = new Error(s); e.summary = s; e.status = r.status; throw e; }
+        if (!r.ok) { const s = (j && j.error_summary) || txt; const e = r.status === 409 ? new Error(s) : friendly(s, r.status); e.summary = s; e.status = r.status; throw e; }
         return j;
       }
       throw new Error('Dropbox is busy — try again in a moment.');
@@ -72,7 +83,7 @@
         const r = await fetch(CONTENT + ep, { method: 'POST', headers: h, body: body == null ? null : body });
         if (r.status === 429 || r.status >= 500) { await new Promise(res => setTimeout(res, 800 * (i + 1))); continue; }
         if (r.status === 401) { Dbx._tok = null; continue; }
-        if (!r.ok) { const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) { /* text */ } const s = (j && j.error_summary) || txt; const e = new Error(s); e.summary = s; e.status = r.status; throw e; }
+        if (!r.ok) { const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) { /* text */ } const s = (j && j.error_summary) || txt; const e = r.status === 409 ? new Error(s) : friendly(s, r.status); e.summary = s; e.status = r.status; throw e; }
         return r;
       }
       throw new Error('Dropbox is busy — try again in a moment.');
